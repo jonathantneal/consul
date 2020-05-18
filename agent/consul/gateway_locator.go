@@ -66,6 +66,7 @@ func (g *GatewayLocator) PrimaryMeshGatewayAddressesReadyCh() <-chan struct{} {
 // PickGateway returns the address for a gateway suitable for reaching the
 // provided datacenter.
 func (g *GatewayLocator) PickGateway(dc string) string {
+	// TODO(wanfed): once local gateways are working, shouldn't we use those to talk to the primary?
 	item := g.pickGateway(dc == g.primaryDatacenter)
 	g.logger.Trace("picking gateway for transit", "gateway", item, "source_datacenter", g.datacenter, "dest_datacenter", dc)
 	return item
@@ -82,13 +83,12 @@ func (g *GatewayLocator) listGateways(primary bool) []string {
 
 	var addrs []string
 	if primary {
-		addrs = g.primaryGateways
+		// Note this only works because both inputs are pre-sorted. If for some
+		// reason one of the lists has *duplicates* that's not great but it
+		// won't break.
+		addrs = lib.StringSliceMergeSorted(g.primaryGateways, g.PrimaryGatewayFallbackAddresses())
 	} else {
 		addrs = g.localGateways
-	}
-
-	if primary && len(addrs) == 0 {
-		addrs = g.PrimaryGatewayFallbackAddresses()
 	}
 
 	return addrs
