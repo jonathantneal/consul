@@ -9,9 +9,24 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 )
 
-type FederationStateReplicator struct {
-	srv *Server
+type gatewayLocatorDelegate interface {
+	SetLastReplicationError(err error)
 }
+
+type FederationStateReplicator struct {
+	srv                    *Server
+	gatewayLocatorDelegate gatewayLocatorDelegate
+}
+
+// TODO(wanfed): if replicated data is fresh, use it, if it is sane also use local
+// if repl hiccups,
+//
+// system is tri state
+// - bootstrap (servers dial primary MGWs from fallback)
+// - handshake (servers dial primary MGWs from fedstate)
+// - connected (servers dial local MGWs from fedstate)
+//
+// We lojack
 
 var _ IndexReplicatorDelegate = (*FederationStateReplicator)(nil)
 
@@ -26,6 +41,14 @@ func (r *FederationStateReplicator) MetricName() string { return "federation-sta
 
 // FetchRemote implements IndexReplicatorDelegate.
 func (r *FederationStateReplicator) FetchRemote(lastRemoteIndex uint64) (int, interface{}, uint64, error) {
+	lenRemote, remote, remoteIndex, err := r.fetchRemote(lastRemoteIndex)
+	if r.gatewayLocatorDelegate != nil {
+		r.gatewayLocatorDelegate.SetLastReplicationError(err)
+	}
+	return lenRemote, remote, remoteIndex, err
+}
+
+func (r *FederationStateReplicator) fetchRemote(lastRemoteIndex uint64) (int, interface{}, uint64, error) {
 	req := structs.DCSpecificRequest{
 		Datacenter: r.srv.config.PrimaryDatacenter,
 		QueryOptions: structs.QueryOptions{

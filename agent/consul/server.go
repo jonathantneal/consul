@@ -439,8 +439,11 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 	federationStateReplicatorConfig := ReplicatorConfig{
 		Name: logging.FederationState,
 		Delegate: &IndexReplicator{
-			Delegate: &FederationStateReplicator{srv: s},
-			Logger:   s.logger,
+			Delegate: &FederationStateReplicator{
+				srv:                    s,
+				gatewayLocatorDelegate: s.gatewayLocator,
+			},
+			Logger: s.logger,
 		},
 		Rate:   s.config.FederationStateReplicationRate,
 		Burst:  s.config.FederationStateReplicationBurst,

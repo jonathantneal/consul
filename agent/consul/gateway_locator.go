@@ -54,6 +54,58 @@ type GatewayLocator struct {
 	// This will be closed the FIRST time we get some gateways populated
 	primaryGatewaysReadyCh   chan struct{}
 	primaryGatewaysReadyOnce sync.Once
+
+	// statistics controlling mode switches
+	modeStatsLock     sync.Mutex
+	lastReplSuccess   time.Time
+	lastReplFailure   time.Time
+	lastReplSuccesses uint64
+	lastReplFailures  uint64
+}
+
+func (g *GatewayLocator) DialPrimaryThroughLocalGateway() bool {
+	g.modeStatsLock.Lock()
+	defer g.modeStatsLock.Unlock()
+	return g.dialPrimaryThroughLocalGateway()
+}
+
+func (g *GatewayLocator) dialPrimaryThroughLocalGateway() bool {
+	if g.lastReplSuccess.IsZero() && g.lastReplFailure.IsZero() {
+		return false // no data yet
+	}
+
+	if g.lastReplSuccess.After(g.lastReplFailure) {
+		return true // we have viable data
+	}
+
+	if g.lastReplFailure.After(g.lastReplSuccess) && g.lastReplFailures <= 3 {
+		return true // maybe it's just a little broken
+	}
+
+	return false
+}
+
+func (g *GatewayLocator) SetLastReplicationError(err error) {
+	g.modeStatsLock.Lock()
+	defer g.modeStatsLock.Unlock()
+	oldChoice := g.dialPrimaryThroughLocalGateway()
+	if err == nil {
+		g.lastReplSuccess = time.Now().UTC()
+		g.lastReplSuccesses++
+		g.lastReplFailures = 0
+	} else {
+		g.lastReplFailure = time.Now().UTC()
+		g.lastReplFailures++
+		g.lastReplSuccesses = 0
+	}
+	newChoice := g.dialPrimaryThroughLocalGateway()
+	if oldChoice != newChoice {
+		if newChoice {
+			g.logger.Info("now dialing the primary through our local gateways if possible")
+		} else {
+			g.logger.Info("now dialing the primary through the primary's gateways")
+		}
+	}
 }
 
 // PrimaryMeshGatewayAddressesReadyCh returns a channel that will be closed
@@ -81,8 +133,9 @@ func (g *GatewayLocator) listGateways(primary bool) []string {
 	g.gatewaysLock.Lock()
 	defer g.gatewaysLock.Unlock()
 
+	// TODO: fix this so that this code actually works in the primary?
 	var addrs []string
-	if primary {
+	if primary && !g.DialPrimaryThroughLocalGateway() {
 		// Note this only works because both inputs are pre-sorted. If for some
 		// reason one of the lists has *duplicates* that's not great but it
 		// won't break.
@@ -275,7 +328,7 @@ func (g *GatewayLocator) updateFromState(results []*structs.FederationState) {
 		)
 	}
 
-	if primaryReady {
+	if primaryReady { // signal to wan join serf operation to begin
 		g.primaryGatewaysReadyOnce.Do(func() {
 			close(g.primaryGatewaysReadyCh)
 		})
