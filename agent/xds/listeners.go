@@ -71,11 +71,7 @@ func (s *Server) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.ConfigSnaps
 		}
 
 		var upstreamListener proto.Message
-		if chain == nil || chain.IsDefault() {
-			upstreamListener, err = s.makeUpstreamListenerIgnoreDiscoveryChain(&u, chain, cfgSnap, nil)
-		} else {
-			upstreamListener, err = s.makeUpstreamListenerForDiscoveryChain(&u, chain, cfgSnap, nil)
-		}
+		upstreamListener, err = s.makeUpstreamListenerForDiscoveryChain(&u, u.LocalBindAddress, chain, cfgSnap, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -271,6 +267,17 @@ func (s *Server) listenersFromSnapshotGateway(cfgSnap *proxycfg.ConfigSnapshot, 
 // See: https://www.consul.io/docs/connect/proxies/envoy.html#mesh-gateway-options
 func (s *Server) listenersFromSnapshotIngressGateway(cfgSnap *proxycfg.ConfigSnapshot) ([]proto.Message, error) {
 	var resources []proto.Message
+
+	seen := make(map[string]bool)
+	var bindAddrs []string
+	for _, addrCfg := range cfgSnap.TaggedAddresses {
+		a := addrCfg.Address
+		if !seen[a] {
+			bindAddrs = append(bindAddrs, a)
+			seen[a] = true
+		}
+	}
+
 	for listenerKey, upstreams := range cfgSnap.IngressGateway.Upstreams {
 		var tlsContext *envoyauth.DownstreamTlsContext
 		if cfgSnap.IngressGateway.TLSEnabled {
@@ -280,49 +287,41 @@ func (s *Server) listenersFromSnapshotIngressGateway(cfgSnap *proxycfg.ConfigSna
 			}
 		}
 
-		if listenerKey.Protocol == "tcp" {
-			// We rely on the invariant of upstreams slice always having at least 1
-			// member, because this key/value pair is created only when a
-			// GatewayService is returned in the RPC
-			u := upstreams[0]
-			id := u.Identifier()
+		for _, address := range bindAddrs {
+			if listenerKey.Protocol == "tcp" {
+				// We rely on the invariant of upstreams slice always having at least 1
+				// member, because this key/value pair is created only when a
+				// GatewayService is returned in the RPC
+				u := upstreams[0]
+				id := u.Identifier()
 
-			chain := cfgSnap.IngressGateway.DiscoveryChain[id]
+				chain := cfgSnap.IngressGateway.DiscoveryChain[id]
 
-			var upstreamListener proto.Message
-			var err error
-			if chain == nil || chain.IsDefault() {
-				upstreamListener, err = s.makeUpstreamListenerIgnoreDiscoveryChain(&u, chain, cfgSnap, tlsContext)
+				var upstreamListener proto.Message
+				upstreamListener, err := s.makeUpstreamListenerForDiscoveryChain(&u, address, chain, cfgSnap, tlsContext)
+				if err != nil {
+					return nil, err
+				}
+				resources = append(resources, upstreamListener)
 			} else {
-				upstreamListener, err = s.makeUpstreamListenerForDiscoveryChain(&u, chain, cfgSnap, tlsContext)
-			}
-			if err != nil {
-				return nil, err
-			}
-			resources = append(resources, upstreamListener)
-		} else {
-			// If multiple upstreams share this port, make a special listener for the protocol.
-			addr := cfgSnap.Address
-			if addr == "" {
-				addr = "0.0.0.0"
-			}
+				// If multiple upstreams share this port, make a special listener for the protocol.
+				listener := makeListener(listenerKey.Protocol, address, listenerKey.Port)
+				filter, err := makeListenerFilter(
+					true, listenerKey.Protocol, listenerKey.RouteName(), "", "ingress_upstream_", "", false)
+				if err != nil {
+					return nil, err
+				}
 
-			listener := makeListener(listenerKey.Protocol, addr, listenerKey.Port)
-			filter, err := makeListenerFilter(
-				true, listenerKey.Protocol, listenerKey.RouteName(), "", "ingress_upstream_", "", false)
-			if err != nil {
-				return nil, err
-			}
-
-			listener.FilterChains = []envoylistener.FilterChain{
-				{
-					Filters: []envoylistener.Filter{
-						filter,
+				listener.FilterChains = []envoylistener.FilterChain{
+					{
+						Filters: []envoylistener.Filter{
+							filter,
+						},
+						TlsContext: tlsContext,
 					},
-					TlsContext: tlsContext,
-				},
+				}
+				resources = append(resources, listener)
 			}
-			resources = append(resources, listener)
 		}
 	}
 
@@ -565,17 +564,10 @@ func (s *Server) makeUpstreamListenerIgnoreDiscoveryChain(
 
 	upstreamID := u.Identifier()
 
-	dc := u.Datacenter
-	if dc == "" {
-		dc = cfgSnap.Datacenter
-	}
-	sni := connect.UpstreamSNI(u, "", dc, cfgSnap.Roots.TrustDomain)
-
-	clusterName := CustomizeClusterName(sni, chain)
-
 	l := makeListener(upstreamID, addr, u.LocalBindPort)
+
 	filter, err := makeListenerFilter(
-		false, cfg.Protocol, upstreamID, clusterName, "upstream_", "", false)
+		false, cfg.Protocol, upstreamID, "", "upstream_", "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -790,6 +782,7 @@ func (s *Server) makeMeshGatewayListener(name, addr string, port int, cfgSnap *p
 
 func (s *Server) makeUpstreamListenerForDiscoveryChain(
 	u *structs.Upstream,
+	address string,
 	chain *structs.CompiledDiscoveryChain,
 	cfgSnap *proxycfg.ConfigSnapshot,
 	tlsContext *envoyauth.DownstreamTlsContext,
@@ -800,19 +793,23 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 		// default config if there is an error so it's safe to continue.
 		s.Logger.Warn("failed to parse", "upstream", u.Identifier(), "error", err)
 	}
+
+	ignoreDiscoveryChain := chain == nil || chain.IsDefault()
 	if cfg.ListenerJSON != "" {
+		if ignoreDiscoveryChain {
+			return makeListenerFromUserConfig(cfg.ListenerJSON)
+		}
 		s.Logger.Warn("ignoring escape hatch setting because already configured for",
 			"discovery chain", chain.ServiceName, "upstream", u.Identifier(), "config", "envoy_listener_json")
 	}
 
-	addr := u.LocalBindAddress
-	if addr == "" {
-		addr = "127.0.0.1"
+	if address == "" {
+		address = "127.0.0.1"
 	}
 
 	upstreamID := u.Identifier()
 
-	l := makeListener(upstreamID, addr, u.LocalBindPort)
+	l := makeListener(upstreamID, address, u.LocalBindPort)
 
 	proto := cfg.Protocol
 	if proto == "" {
@@ -825,7 +822,16 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 
 	useRDS := true
 	clusterName := ""
-	if proto == "tcp" {
+
+	if ignoreDiscoveryChain {
+		dc := u.Datacenter
+		if dc == "" {
+			dc = cfgSnap.Datacenter
+		}
+		sni := connect.UpstreamSNI(u, "", dc, cfgSnap.Roots.TrustDomain)
+
+		clusterName = CustomizeClusterName(sni, chain)
+	} else if proto == "tcp" {
 		startNode := chain.Nodes[chain.StartNode]
 		if startNode == nil {
 			panic("missing first node in compiled discovery chain for: " + chain.ServiceName)
