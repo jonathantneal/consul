@@ -277,6 +277,9 @@ func (s *Server) listenersFromSnapshotIngressGateway(cfgSnap *proxycfg.ConfigSna
 			seen[a] = true
 		}
 	}
+	if len(bindAddrs) == 0 {
+		bindAddrs = []string{"0.0.0.0"}
+	}
 
 	for listenerKey, upstreams := range cfgSnap.IngressGateway.Upstreams {
 		var tlsContext *envoyauth.DownstreamTlsContext
@@ -812,7 +815,7 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 	l := makeListener(upstreamID, address, u.LocalBindPort)
 
 	proto := cfg.Protocol
-	if proto == "" {
+	if proto == "" && chain != nil {
 		proto = chain.Protocol
 	}
 
@@ -831,6 +834,7 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 		sni := connect.UpstreamSNI(u, "", dc, cfgSnap.Roots.TrustDomain)
 
 		clusterName = CustomizeClusterName(sni, chain)
+		useRDS = false
 	} else if proto == "tcp" {
 		startNode := chain.Nodes[chain.StartNode]
 		if startNode == nil {

@@ -269,6 +269,16 @@ func TestListenersFromSnapshot(t *testing.T) {
 			setup:  nil,
 		},
 		{
+			name:   "ingress-gateway-tagged-addrs",
+			create: proxycfg.TestConfigSnapshotIngressGateway,
+			setup: func(snap *proxycfg.ConfigSnapshot) {
+				snap.TaggedAddresses = map[string]structs.ServiceAddress{
+					"lan": structs.ServiceAddress{Address: "10.0.0.1"},
+					"wan": structs.ServiceAddress{Address: "172.16.0.1"},
+				}
+			},
+		},
+		{
 			name:   "ingress-gateway-no-services",
 			create: proxycfg.TestConfigSnapshotIngressGatewayNoServices,
 			setup:  nil,

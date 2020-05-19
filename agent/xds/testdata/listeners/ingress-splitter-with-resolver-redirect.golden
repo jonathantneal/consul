@@ -3,10 +3,10 @@
   "resources": [
     {
       "@type": "type.googleapis.com/envoy.api.v2.Listener",
-      "name": "http:1.2.3.4:9191",
+      "name": "http:0.0.0.0:9191",
       "address": {
         "socketAddress": {
-          "address": "1.2.3.4",
+          "address": "0.0.0.0",
           "portValue": 9191
         }
       },
