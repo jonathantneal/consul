@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/consul/logging"
+	"github.com/hashicorp/go-hclog"
 
 	envoy "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	envoyauth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
@@ -71,7 +72,13 @@ func (s *Server) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.ConfigSnaps
 		}
 
 		var upstreamListener proto.Message
-		upstreamListener, err = s.makeUpstreamListenerForDiscoveryChain(&u, u.LocalBindAddress, chain, cfgSnap, nil)
+		upstreamListener, err = s.makeUpstreamListenerForDiscoveryChain(
+			&u,
+			u.LocalBindAddress,
+			chain,
+			cfgSnap,
+			nil,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -301,7 +308,13 @@ func (s *Server) listenersFromSnapshotIngressGateway(cfgSnap *proxycfg.ConfigSna
 				chain := cfgSnap.IngressGateway.DiscoveryChain[id]
 
 				var upstreamListener proto.Message
-				upstreamListener, err := s.makeUpstreamListenerForDiscoveryChain(&u, address, chain, cfgSnap, tlsContext)
+				upstreamListener, err := s.makeUpstreamListenerForDiscoveryChain(
+					&u,
+					address,
+					chain,
+					cfgSnap,
+					tlsContext,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -543,49 +556,6 @@ func (s *Server) makeExposedCheckListener(cfgSnap *proxycfg.ConfigSnapshot, clus
 	return l, err
 }
 
-// makeUpstreamListenerIgnoreDiscoveryChain counterintuitively takes an (optional) chain
-func (s *Server) makeUpstreamListenerIgnoreDiscoveryChain(
-	u *structs.Upstream,
-	chain *structs.CompiledDiscoveryChain,
-	cfgSnap *proxycfg.ConfigSnapshot,
-	tlsContext *envoyauth.DownstreamTlsContext,
-) (proto.Message, error) {
-	cfg, err := ParseUpstreamConfig(u.Config)
-	if err != nil {
-		// Don't hard fail on a config typo, just warn. The parse func returns
-		// default config if there is an error so it's safe to continue.
-		s.Logger.Warn("failed to parse", "upstream", u.Identifier(), "error", err)
-	}
-	if cfg.ListenerJSON != "" {
-		return makeListenerFromUserConfig(cfg.ListenerJSON)
-	}
-
-	addr := u.LocalBindAddress
-	if addr == "" {
-		addr = "127.0.0.1"
-	}
-
-	upstreamID := u.Identifier()
-
-	l := makeListener(upstreamID, addr, u.LocalBindPort)
-
-	filter, err := makeListenerFilter(
-		false, cfg.Protocol, upstreamID, "", "upstream_", "", false)
-	if err != nil {
-		return nil, err
-	}
-
-	l.FilterChains = []envoylistener.FilterChain{
-		{
-			Filters: []envoylistener.Filter{
-				filter,
-			},
-			TlsContext: tlsContext,
-		},
-	}
-	return l, nil
-}
-
 func (s *Server) makeTerminatingGatewayListener(name, addr string, port int, cfgSnap *proxycfg.ConfigSnapshot, token string) (*envoy.Listener, error) {
 	l := makeListener(name, addr, port)
 
@@ -790,66 +760,44 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 	cfgSnap *proxycfg.ConfigSnapshot,
 	tlsContext *envoyauth.DownstreamTlsContext,
 ) (proto.Message, error) {
-	cfg, err := ParseUpstreamConfigNoDefaults(u.Config)
-	if err != nil {
-		// Don't hard fail on a config typo, just warn. The parse func returns
-		// default config if there is an error so it's safe to continue.
-		s.Logger.Warn("failed to parse", "upstream", u.Identifier(), "error", err)
-	}
-
-	ignoreDiscoveryChain := chain == nil || chain.IsDefault()
-	if cfg.ListenerJSON != "" {
-		if ignoreDiscoveryChain {
-			return makeListenerFromUserConfig(cfg.ListenerJSON)
-		}
-		s.Logger.Warn("ignoring escape hatch setting because already configured for",
-			"discovery chain", chain.ServiceName, "upstream", u.Identifier(), "config", "envoy_listener_json")
-	}
-
 	if address == "" {
 		address = "127.0.0.1"
 	}
-
 	upstreamID := u.Identifier()
-
 	l := makeListener(upstreamID, address, u.LocalBindPort)
 
-	proto := cfg.Protocol
-	if proto == "" && chain != nil {
-		proto = chain.Protocol
-	}
-
-	if proto == "" {
-		proto = "tcp"
+	cfg := getAndModifyUpstreamConfigForListener(s.Logger, u, chain)
+	if cfg.ListenerJSON != "" {
+		return makeListenerFromUserConfig(cfg.ListenerJSON)
 	}
 
 	useRDS := true
 	clusterName := ""
-
-	if ignoreDiscoveryChain {
+	if chain == nil || chain.IsDefault() {
 		dc := u.Datacenter
 		if dc == "" {
 			dc = cfgSnap.Datacenter
 		}
 		sni := connect.UpstreamSNI(u, "", dc, cfgSnap.Roots.TrustDomain)
 
-		clusterName = CustomizeClusterName(sni, chain)
 		useRDS = false
-	} else if proto == "tcp" {
+		clusterName = CustomizeClusterName(sni, chain)
+	} else if cfg.Protocol == "tcp" {
 		startNode := chain.Nodes[chain.StartNode]
 		if startNode == nil {
 			panic("missing first node in compiled discovery chain for: " + chain.ServiceName)
 		} else if startNode.Type != structs.DiscoveryGraphNodeTypeResolver {
-			panic(fmt.Sprintf("unexpected first node in discovery chain using protocol=%q: %s", proto, startNode.Type))
+			panic(fmt.Sprintf("unexpected first node in discovery chain using protocol=%q: %s", cfg.Protocol, startNode.Type))
 		}
 		targetID := startNode.Resolver.Target
 		target := chain.Targets[targetID]
-		clusterName = CustomizeClusterName(target.Name, chain)
+
 		useRDS = false
+		clusterName = CustomizeClusterName(target.Name, chain)
 	}
 
 	filter, err := makeListenerFilter(
-		useRDS, proto, upstreamID, clusterName, "upstream_", "", false)
+		useRDS, cfg.Protocol, upstreamID, clusterName, "upstream_", "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -863,6 +811,53 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 		},
 	}
 	return l, nil
+}
+
+func getAndModifyUpstreamConfigForListener(logger hclog.Logger, u *structs.Upstream, chain *structs.CompiledDiscoveryChain) UpstreamConfig {
+	var (
+		cfg UpstreamConfig
+		err error
+	)
+
+	if chain == nil || chain.IsDefault() {
+		cfg, err = ParseUpstreamConfig(u.Config)
+		if err != nil {
+			// Don't hard fail on a config typo, just warn. The parse func returns
+			// default config if there is an error so it's safe to continue.
+			logger.Warn("failed to parse", "upstream", u.Identifier(), "error", err)
+		}
+	} else {
+		// Use NoDefaults here so that we can set the protocol to the chain
+		// protocol if necessary
+		cfg, err = ParseUpstreamConfigNoDefaults(u.Config)
+		if err != nil {
+			// Don't hard fail on a config typo, just warn. The parse func returns
+			// default config if there is an error so it's safe to continue.
+			logger.Warn("failed to parse", "upstream", u.Identifier(), "error", err)
+		}
+
+		if cfg.ListenerJSON != "" {
+			logger.Warn("ignoring escape hatch setting because already configured for",
+				"discovery chain", chain.ServiceName, "upstream", u.Identifier(), "config", "envoy_listener_json")
+
+			// Remove from config struct so we don't use it later on
+			cfg.ListenerJSON = ""
+		}
+
+		proto := cfg.Protocol
+		if proto == "" {
+			proto = chain.Protocol
+		}
+
+		if proto == "" {
+			proto = "tcp"
+		}
+
+		// set back on the config so that we can use it from return value
+		cfg.Protocol = proto
+	}
+
+	return cfg
 }
 
 func makeListenerFilter(
