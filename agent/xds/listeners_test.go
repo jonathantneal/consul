@@ -129,6 +129,17 @@ func TestListenersFromSnapshot(t *testing.T) {
 			},
 		},
 		{
+			name:   "custom-upstream-typed-ignored-with-disco-chain",
+			create: proxycfg.TestConfigSnapshotDiscoveryChainWithFailover,
+			setup: func(snap *proxycfg.ConfigSnapshot) {
+				snap.Proxy.Upstreams[0].Config["envoy_listener_json"] =
+					customListenerJSON(t, customListenerJSONOptions{
+						Name:        "custom-upstream",
+						IncludeType: true,
+					})
+			},
+		},
+		{
 			name:   "splitter-with-resolver-redirect",
 			create: proxycfg.TestConfigSnapshotDiscoveryChain_SplitterWithResolverRedirectMultiDC,
 			setup:  nil,
